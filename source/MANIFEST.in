@@ -1,0 +1,5 @@
+include README.md LICENSE WIP.md
+recursive-include native_cli *.swift *.c *.h
+recursive-include script *.sh
+recursive-include tests *.py
+recursive-include src/dt_i4x/native *.c *.h *.inc *.txt

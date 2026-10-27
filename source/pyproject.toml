@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drawthings-i4x"
+version = "0.1.0"
+description = "Convert native Draw Things checkpoint matrices to 4-bit S (i4x) on macOS"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+dependencies = ["numpy>=1.24"]
+classifiers = ["Operating System :: MacOS", "Programming Language :: Python :: 3"]
+
+[project.scripts]
+dt-i4x = "dt_i4x.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+dt_i4x = ["native/*.c", "native/*.h", "native/*.inc", "native/*.txt"]
