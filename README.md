@@ -1,5 +1,11 @@
 # Draw Things i4x
 
+> [!WARNING]
+> This entire repo is 100% from a ChatGPT work mode request</br>
+> It even wrote this README.md except for this warning. </br>
+> No due dilgence performed, code offered `AS-IS`
+
+
 A small, standalone macOS command-line tool that converts native Draw Things checkpoint matrices to **4-bit S (`i4x`)**. Built with Swift and the upstream ccv CPU quantizer. No Python, NumPy, compiler, app installation, model download, or network connection is required to run the executable.
 
 The initial use case is the Qwen3-VL 8B text encoder used by Qwen Image 2.1. Its 8.18 GiB native i8x checkpoint converts to a 4.51 GiB file while preserving the vision tower and small tensors.
