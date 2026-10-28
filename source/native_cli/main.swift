@@ -7,6 +7,29 @@ let hFlag: UInt64 = 0x01000000
 let i8x: UInt64 = 0x8a1e9b
 let i4x: UInt64 = 0x8a1eab
 let palettes: Set<UInt64> = [0x8a1e4b,0x8a1e5b,0x8a1e6b,0x8a1e7b,0x8a1e8b]
+struct QuantizationFormat {
+  let name:String;let packed:Int32;let identifier:UInt64;let suffix:String
+}
+// Packed values and checkpoint identifiers follow the pinned ccv and s4nnc versions.
+let quantizationFormats = [
+  QuantizationFormat(name:"q4k",packed:1,identifier:0x8a1eab,suffix:"i4x"),
+  QuantizationFormat(name:"q3k",packed:2,identifier:0x8a1eac,suffix:"i3x"),
+  QuantizationFormat(name:"q2k",packed:3,identifier:0x8a1ead,suffix:"i2x"),
+  QuantizationFormat(name:"iq2s",packed:4,identifier:0x8a1eae,suffix:"iq2s"),
+  QuantizationFormat(name:"iq2xs",packed:5,identifier:0x8a1eaf,suffix:"iq2xs"),
+  QuantizationFormat(name:"iq3s",packed:6,identifier:0x8a1eb0,suffix:"iq3s"),
+  QuantizationFormat(name:"iq3xxs",packed:7,identifier:0x8a1eb1,suffix:"iq3xxs"),
+  QuantizationFormat(name:"iq2xxs",packed:8,identifier:0x8a1eb2,suffix:"iq2xxs"),
+  QuantizationFormat(name:"q5k",packed:9,identifier:0x8a1eb3,suffix:"i5x"),
+  QuantizationFormat(name:"q6k",packed:10,identifier:0x8a1eb4,suffix:"i6x"),
+]
+func targetFormat(_ value:String) throws -> QuantizationFormat {
+  let name=value.lowercased().replacingOccurrences(of:"_",with:"")
+  guard let format=quantizationFormats.first(where:{$0.name==name || $0.suffix==name}) else {
+    throw Failure.message("Unknown format: \(value). Choose \(quantizationFormats.map(\.suffix).joined(separator:", "))")
+  }
+  return format
+}
 let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 enum Failure: Error, CustomStringConvertible {
   case message(String)
@@ -26,13 +49,16 @@ func encoded(_ value: UInt64, _ bytes: Int = 8, big: Bool = false) -> Data {
 }
 func base(_ id: UInt64) -> UInt64 { id & ~(external | hFlag) }
 func codecName(_ id: UInt64) -> String {
-  [UInt64(0):"raw",0x511:"ezm7",i8x:"i8x",i4x:"i4x",0x8a1e4b:"q4p",0x8a1e5b:"q5p",0x8a1e6b:"q6p",0x8a1e7b:"q7p",0x8a1e8b:"q8p"][base(id)] ?? ("0x"+String(id,radix:16))
+  if let format=quantizationFormats.first(where:{$0.identifier==base(id)}) {return format.suffix}
+  return [UInt64(0):"raw",0x511:"ezm7",i8x:"i8x",0x8a1e4b:"q4p",0x8a1e5b:"q5p",0x8a1e6b:"q6p",0x8a1e7b:"q7p",0x8a1e8b:"q8p"][base(id)] ?? ("0x"+String(id,radix:16))
 }
 func digest(_ data: Data) -> String { SHA256.hash(data: data).map { String(format:"%02x",$0) }.joined() }
-func fileDigest(_ url: URL) throws -> String {
+func fileDigest(_ url: URL, progress: ((Int,Int)->Void)? = nil) throws -> String {
   let file=try FileHandle(forReadingFrom:url); defer {try? file.close()}
+  let total=Int(try file.seekToEnd());try file.seek(toOffset:0)
+  var completed=0
   var hash=SHA256()
-  while let chunk=try file.read(upToCount:8<<20),!chunk.isEmpty {hash.update(data:chunk)}
+  while let chunk=try file.read(upToCount:8<<20),!chunk.isEmpty {hash.update(data:chunk);completed+=chunk.count;progress?(completed,total)}
   return hash.finalize().map {String(format:"%02x",$0)}.joined()
 }
 func json(_ object: Any) throws -> Data { try JSONSerialization.data(withJSONObject:object,options:[.prettyPrinted,.sortedKeys]) }
@@ -138,26 +164,45 @@ final class Store {
 }
 
 struct Options {
-  var input:URL;var outputDirectory:URL?;var all=false;var hadamard=true;var inspect=false;var quiet=false
+  var input:URL;var outputDirectory:URL?;var hadamard=true;var inspect=false;var quiet=false
+  var format=quantizationFormats[0]
 }
-func eligible(_ name:String,_ shape:[Int],_ all:Bool)->Bool {
-  let text=name.range(of:"^__text_model(?:_?[0-9]+)?__",options:.regularExpression) != nil
-  return (text || all) && shape.count==2 && shape.min()!>1
+final class Progress {
+  let quiet:Bool
+  let started=Date()
+  var lastUpdate=Date.distantPast
+  init(_ quiet:Bool) {self.quiet=quiet}
+  func update(_ phase:String,_ completed:Int=0,_ total:Int=0,_ detail:String="",force:Bool=false) {
+    let now=Date()
+    guard !quiet && (force || now.timeIntervalSince(lastUpdate)>=1) else {return}
+    lastUpdate=now
+    let percent=total>0 ? String(format:" %5.1f%%",100*Double(completed)/Double(total)) : ""
+    let elapsed=Int(now.timeIntervalSince(started))
+    FileHandle.standardError.write(Data("\(phase)\(percent) | elapsed \(elapsed)s\(detail.isEmpty ? "" : " | "+detail)\n".utf8))
+  }
+}
+func textModel(_ name:String)->Bool {
+  name.range(of:"^__text_model(?:_?[0-9]+)?__",options:.regularExpression) != nil
+}
+func eligible(_ shape:[Int])->Bool {
+  shape.count==2 && shape.min()!>1
 }
 func rotated(_ name:String,_ width:Int,_ enabled:Bool)->Bool {
-  enabled && width%256==0 && name.range(of:"(?:t-(?:q_proj|k_proj|v_proj|out_proj)-|mlp_(?:gate|up|down)_proj-)",options:.regularExpression) != nil
+  // Keep the established text-projection allowlist; dimensions alone do not identify an operator.
+  enabled && textModel(name) && width%256==0 && name.range(of:"(?:t-(?:q_proj|k_proj|v_proj|out_proj)-|mlp_(?:gate|up|down)_proj-)",options:.regularExpression) != nil
 }
-func inspect(_ source:Store,_ all:Bool) throws -> [String:Any] {
-  var n=0,total=0,codecs=Set<String>(),unsupported=[[String:Any]]()
+func inspect(_ source:Store,_ hadamard:Bool=true) throws -> [String:Any] {
+  var n=0,total=0,rotations=0,codecs=Set<String>(),unsupported=[[String:Any]]()
   for tensor in source.records {
     let shape=try dimensions(tensor.dim)
-    if !eligible(tensor.name,shape,all) {continue}
+    if !eligible(shape) {continue}
     n+=1;total+=try count(shape);codecs.insert(codecName(tensor.id))
-    if !([UInt64(0),0x511,i8x].contains(base(tensor.id)) || palettes.contains(base(tensor.id))) || ![Int32(0x20000),0x4000,0x10000,0x80000].contains(tensor.dtype) || tensor.datatype>>32 != 0 {
+    if rotated(tensor.name,shape.last!,hadamard) {rotations+=1}
+    if !([UInt64(0),0x511,i8x].contains(base(tensor.id)) || palettes.contains(base(tensor.id)) || quantizationFormats.contains(where:{$0.identifier==base(tensor.id)})) || ![Int32(0x20000),0x4000,0x10000,0x80000].contains(tensor.dtype) || tensor.datatype>>32 != 0 {
       unsupported.append(["name":tensor.name,"codec":codecName(tensor.id),"datatype":tensor.datatype])
     }
   }
-  return ["input":source.url.path,"total_tensors":source.records.count,"selected_matrices":n,"selected_parameters":total,"source_codecs":codecs.sorted(),"unsupported":unsupported]
+  return ["input":source.url.path,"total_tensors":source.records.count,"selected_matrices":n,"selected_parameters":total,"source_codecs":codecs.sorted(),"unsupported":unsupported,"hadamard_policy":hadamard ? "auto" : "disabled","hadamard_matrices":rotations,"plain_matrices":n-rotations]
 }
 func decoded(_ payload:Data,_ tensor:Tensor,_ shape:[Int]) throws -> Data {
   let n=try count(shape),size=try itemSize(tensor.dtype)
@@ -176,6 +221,14 @@ func decoded(_ payload:Data,_ tensor:Tensor,_ shape:[Int]) throws -> Data {
     let ok=result.withUnsafeMutableBytes {out in payload.withUnsafeBytes {input in dt_decode_ezm7(input.bindMemory(to:UInt8.self).baseAddress,payload.count,out.bindMemory(to:UInt16.self).baseAddress,n)}}
     try require(ok==1,"Invalid EZM7 payload");return result
   default:
+    if let format=quantizationFormats.first(where:{$0.identifier==base(tensor.id)}) {
+      let packed=format.packed | (tensor.id&hFlag != 0 ? 0x100 : 0)
+      let expected=ccv_nnc_8i_rowwise_x_data_size(packed,tensor.dtype,n,shape.last!)
+      try require(expected>0 && payload.count==expected,"Incorrect packed rowwise payload size or incompatible H256 width: \(tensor.name)")
+      var result=Data(count:bytes)
+      result.withUnsafeMutableBytes {out in payload.withUnsafeBytes {input in ccv_nnc_dequantize_8i_rowwise_x(input.baseAddress,tensor.dtype,1,payload.count,shape.last!,packed,out.baseAddress,n)}}
+      return result
+    }
     try require(palettes.contains(base(tensor.id)),"Unsupported codec: \(codecName(tensor.id))")
     let bits=Int32(((base(tensor.id)>>4)&15))
     var result=Data(count:bytes)
@@ -183,8 +236,8 @@ func decoded(_ payload:Data,_ tensor:Tensor,_ shape:[Int]) throws -> Data {
     try require(ok==1,"Invalid or unsupported partial palette block: \(tensor.name)");return result
   }
 }
-func quantize(_ values:Data,_ tensor:Tensor,_ shape:[Int],_ rotation:Bool) throws -> (Data,Double) {
-  let n=try count(shape),width=shape.last!,packed:Int32=rotation ? 0x101 : 1
+func quantize(_ values:Data,_ tensor:Tensor,_ shape:[Int],_ rotation:Bool,_ format:QuantizationFormat) throws -> (Data,Double) {
+  let n=try count(shape),width=shape.last!,packed=format.packed | (rotation ? 0x100 : 0)
   let finite=values.withUnsafeBytes {dt_finite($0.baseAddress,tensor.dtype,n)}
   try require(finite==1,"Nonfinite input: \(tensor.name)")
   let size=ccv_nnc_8i_rowwise_x_data_size(packed,tensor.dtype,n,width)
@@ -203,17 +256,24 @@ func align(_ file:FileHandle) throws -> UInt64 {
   if aligned>offset {try file.write(contentsOf:Data(count:Int(aligned-offset)))}
   return aligned
 }
-func copy(_ source:URL,_ output:FileHandle) throws {
+func copy(_ source:URL,_ output:FileHandle, progress: ((Int,Int)->Void)? = nil) throws {
   let file=try FileHandle(forReadingFrom:source);defer{try? file.close()}
-  while let data=try file.read(upToCount:8<<20),!data.isEmpty {try output.write(contentsOf:data)}
+  let total=Int(try file.seekToEnd());try file.seek(toOffset:0)
+  var completed=0
+  while let data=try file.read(upToCount:8<<20),!data.isEmpty {try output.write(contentsOf:data);completed+=data.count;progress?(completed,total)}
 }
-func convert(_ source:Store,_ destination:URL,_ options:Options) throws {
+func convert(_ source:Store,_ destination:URL,_ options:Options) throws -> [String:Any] {
   let fm=FileManager.default
   try require(!fm.fileExists(atPath:destination.path),"Output already exists: \(destination.path)")
-  let info=try inspect(source,options.all)
-  try require(info["selected_matrices"] as! Int>0,"No matching text matrices; use --all-matrices for other layouts")
+  try require(!fm.fileExists(atPath:destination.deletingPathExtension().appendingPathExtension("validation.json").path),"Validation manifest already exists for: \(destination.path)")
+  let info=try inspect(source,options.hadamard)
+  let matrixTotal=info["selected_matrices"] as! Int,parameterTotal=info["selected_parameters"] as! Int
+  try require(matrixTotal>0,"No eligible 2D matrices found for the selected scope")
   let unsupported=info["unsupported"] as! [[String:Any]]
-  try require(unsupported.isEmpty,"Unsupported selected source codec. Run --inspect for details. Supported sources: raw FP16/FP32/FP64/BF16, EZM7 FP16, i8x, q4p/q5p/q6p/q7p/q8p. No output was created.")
+  try require(unsupported.isEmpty,"Unsupported selected source codec or datatype. Run --inspect for details and --help for supported sources. No output was created.")
+  let progress=Progress(options.quiet)
+  progress.update("Preparing",0,0,"\(matrixTotal) matrices; format: \(options.format.suffix); H256: \(info["hadamard_matrices"]!) auto-selected; unrotated: \(info["plain_matrices"]!)",force:true)
+  progress.update("Checking source SQLite",force:true)
   try source.db.integrity()
   let stage=URL(fileURLWithPath:destination.path+".work",isDirectory:true)
   try require(!fm.fileExists(atPath:stage.path),"Intermediate directory already exists: \(stage.path)")
@@ -229,17 +289,19 @@ func convert(_ source:Store,_ destination:URL,_ options:Options) throws {
   let started=Date()
   for tensor in source.records {
     let shape=try dimensions(tensor.dim)
-    let selected=eligible(tensor.name,shape,options.all)
+    let selected=eligible(shape)
     var (payload,prefix)=try source.payload(tensor)
     var identifier=tensor.id
     var entry:[String:Any]=["name":tensor.name,"shape":shape,"input_codec":String(identifier,radix:16),"input_payload_bytes":payload.count]
     if selected {
+      let rotation=rotated(tensor.name,shape.last!,options.hadamard)
+      progress.update("Quantizing",weights,parameterTotal,"[\(converted)/\(matrixTotal) complete] \(options.format.suffix) \(rotation ? "H256" : "unrotated") \(tensor.name)",force:true)
       let sourceBytes=palettes.contains(base(tensor.id)) && tensor.id&external != 0 ? Data(prefix.prefix(4))+payload : payload
-      let values=try decoded(sourceBytes,tensor,shape),rotation=rotated(tensor.name,shape.last!,options.hadamard)
-      let (packed,error)=try quantize(values,tensor,shape,rotation)
-      payload=packed;prefix=Data();identifier=i4x|(rotation ? hFlag : 0);converted+=1;weights+=try count(shape)
-      entry["relative_rmse"]=error
-      if !options.quiet {print(String(format:"%3d %@ -> %.1f MB; relRMSE %.4f",converted,tensor.name,Double(payload.count)/1e6,error));fflush(stdout)}
+      let values=try decoded(sourceBytes,tensor,shape)
+      let (packed,error)=try quantize(values,tensor,shape,rotation,options.format)
+      payload=packed;prefix=Data();identifier=options.format.identifier|(rotation ? hFlag : 0);converted+=1;weights+=try count(shape)
+      entry["relative_rmse"]=error;entry["hadamard"]=rotation
+      progress.update("Quantizing",weights,parameterTotal,String(format:"[%d/%d complete] %@ -> %.1f MB; relRMSE %.4f",converted,matrixTotal,tensor.name,Double(payload.count)/1e6,error))
     }
     let hash=digest(payload);hashes[tensor.name]=hash
     var metadata=payload
@@ -257,55 +319,150 @@ func convert(_ source:Store,_ destination:URL,_ options:Options) throws {
     try require(sqlite3_step(statement)==SQLITE_DONE,"SQLite tensor write failed: \(tensor.name)")
     entry["output_codec"]=String(identifier,radix:16);entry["output_payload_bytes"]=payload.count;entry["payload_sha256"]=hash;entries.append(entry)
   }
+  progress.update("Quantizing",weights,parameterTotal,"[\(converted)/\(matrixTotal) complete]",force:true)
   try file.synchronize();try file.close();try db.exec("COMMIT");try db.integrity()
   let assembled=stage.appendingPathComponent("assembled.ckpt")
   fm.createFile(atPath:assembled.path,contents:nil)
   let output=try FileHandle(forWritingTo:assembled)
+  progress.update("Assembling checkpoint",force:true)
   try copy(databaseURL,output);let trailer=try align(output)
   try require(trailer<=UInt64(UInt32.max),"Metadata exceeds native trailer offset limit")
-  try copy(dataURL,output);try output.seek(toOffset:60);try output.write(contentsOf:encoded(trailer,4,big:true));try output.synchronize();try output.close()
+  try copy(dataURL,output,progress:{progress.update("Assembling checkpoint",$0,$1)});try output.seek(toOffset:60);try output.write(contentsOf:encoded(trailer,4,big:true));try output.synchronize();try output.close()
+  progress.update("Checking output SQLite",force:true)
   let final=try Store(assembled);try final.db.integrity()
   try require(final.records.map(\.name)==source.records.map(\.name),"Final tensor names differ")
-  for tensor in final.records {let(payload,_)=try final.payload(tensor);try require(digest(payload)==hashes[tensor.name],"Final payload hash mismatch: \(tensor.name)")}
+  progress.update("Verifying tensors",0,final.records.count,force:true)
+  for (index,tensor) in final.records.enumerated() {let(payload,_)=try final.payload(tensor);try require(digest(payload)==hashes[tensor.name],"Final payload hash mismatch: \(tensor.name)");progress.update("Verifying tensors",index+1,final.records.count)}
   let outputSize=(try fm.attributesOfItem(atPath:assembled.path)[.size] as! NSNumber).uint64Value
-  let manifest:[String:Any]=["input":source.url.path,"output_bytes":outputSize,"converted_tensors":converted,"converted_elements":weights,"total_tensors":entries.count,"sha256":try fileDigest(assembled),"elapsed_seconds":Date().timeIntervalSince(started),"tensors":entries,"upstream_ccv":"810fb2992bd4b5463052a8f94338c8bffc273cc6"]
+  progress.update("Hashing checkpoint",force:true)
+  let hash=try fileDigest(assembled,progress:{progress.update("Hashing checkpoint",$0,$1)})
+  let manifest:[String:Any]=["input":source.url.path,"output_format":options.format.name,"output_bytes":outputSize,"converted_tensors":converted,"converted_elements":weights,"total_tensors":entries.count,"sha256":hash,"elapsed_seconds":Date().timeIntervalSince(started),"hadamard_policy":info["hadamard_policy"]!,"hadamard_matrices":info["hadamard_matrices"]!,"plain_matrices":info["plain_matrices"]!,"tensors":entries,"upstream_ccv":"810fb2992bd4b5463052a8f94338c8bffc273cc6"]
   try fm.linkItem(at:assembled,to:destination)
   try json(manifest).write(to:destination.deletingPathExtension().appendingPathExtension("validation.json"),options:.atomic)
   // Only this invocation's generated work directory is removed; input and sidecars are untouched.
   try fm.removeItem(at:stage)
-  print(destination.path)
-  if !options.quiet {print(String(format:"%.2f GiB; %d matrices converted; all %d tensor payloads verified.",Double(outputSize)/pow(1024,3),converted,entries.count))}
+  progress.update("Finished",1,1,force:true)
+  return manifest
+}
+
+func outputURL(_ source:URL,_ folder:URL,_ format:QuantizationFormat)->URL {
+  let stem=source.deletingPathExtension().lastPathComponent.replacingOccurrences(of:"_(?:i[2-8]x|iq[23](?:s|xs|xxs)|q[2-6]k|q[4-8]p|f16|fp16|bf16|f32|fp32)$",with:"",options:[.regularExpression,.caseInsensitive])
+  return folder.appendingPathComponent(stem+"_"+format.suffix+".ckpt")
+}
+func importerExecutable(_ override:String?) throws -> URL {
+  let candidates:[String]
+  if let override {candidates=[(override as NSString).expandingTildeInPath]} else {
+    candidates=(ProcessInfo.processInfo.environment["PATH"] ?? "").components(separatedBy:":").map {URL(fileURLWithPath:$0.isEmpty ? FileManager.default.currentDirectoryPath : $0).appendingPathComponent("draw-things-cli").path}
+  }
+  guard let path=candidates.first(where:{FileManager.default.isExecutableFile(atPath:$0)}) else {
+    throw Failure.message("Safetensors import requires draw-things-cli on PATH or --draw-things-cli PATH. Native .ckpt conversion needs no importer.")
+  }
+  return URL(fileURLWithPath:path).standardizedFileURL
+}
+func runImport(_ source:URL,_ stage:URL,_ executable:URL,_ quiet:Bool,_ dryRun:Bool=false) throws -> URL {
+  let fm=FileManager.default,models=stage.appendingPathComponent("models",isDirectory:true)
+  try require(fm.fileExists(atPath:source.path),"Input does not exist: \(source.path)")
+  try fm.createDirectory(at:models,withIntermediateDirectories:false)
+  let process=Process(),pipe=Pipe(),logURL=stage.appendingPathComponent("import.log")
+  fm.createFile(atPath:logURL.path,contents:nil)
+  let log=try FileHandle(forWritingTo:logURL);defer{try? log.close()}
+  process.executableURL=executable
+  process.arguments=["models","import",source.path,"--models-dir",models.path,"--offline","--no-download-missing"]+(dryRun ? ["--dry-run"] : [])
+  process.standardInput=FileHandle.nullDevice;process.standardOutput=pipe;process.standardError=pipe
+  try process.run()
+  try pipe.fileHandleForWriting.close()
+  while let data=try pipe.fileHandleForReading.read(upToCount:4096),!data.isEmpty {
+    try log.write(contentsOf:data)
+    if !quiet {try (dryRun ? FileHandle.standardOutput : FileHandle.standardError).write(contentsOf:data)}
+  }
+  try pipe.fileHandleForReading.close();process.waitUntilExit()
+  try require(process.terminationStatus==0,"Official Draw Things importer exited with status \(process.terminationStatus). Details: \(logURL.path)")
+  return models
+}
+func inspectSafetensors(_ source:URL,_ executable:URL) throws {
+  let fm=FileManager.default,stage=fm.temporaryDirectory.appendingPathComponent("dt-quant-inspect-"+UUID().uuidString,isDirectory:true)
+  try fm.createDirectory(at:stage,withIntermediateDirectories:false);defer{try? fm.removeItem(at:stage)}
+  _=try runImport(source,stage,executable,false,true)
+}
+func convertSafetensors(_ source:URL,_ destination:URL,_ options:Options,_ executable:URL) throws -> [String:Any] {
+  let fm=FileManager.default,specURL=destination.deletingPathExtension().appendingPathExtension("model.json")
+  for path in [destination,specURL,destination.deletingPathExtension().appendingPathExtension("validation.json")] {
+    try require(!fm.fileExists(atPath:path.path),"Output already exists: \(path.path)")
+  }
+  let stage=URL(fileURLWithPath:destination.path+".import.work",isDirectory:true)
+  try require(!fm.fileExists(atPath:stage.path),"Import work directory already exists: \(stage.path)")
+  try fm.createDirectory(at:stage,withIntermediateDirectories:true)
+  let models=try runImport(source,stage,executable,options.quiet)
+  let customURL=models.appendingPathComponent("custom.json")
+  let object=try JSONSerialization.jsonObject(with:Data(contentsOf:customURL))
+  guard let specifications=object as? [[String:Any]],specifications.count==1,var specification=specifications.first,
+        let name=specification["file"] as? String,(name as NSString).lastPathComponent==name else {
+    throw Failure.message("Importer produced no unique primary model specification. See \(stage.appendingPathComponent("import.log").path)")
+  }
+  let imported=models.appendingPathComponent(name)
+  try require(fm.fileExists(atPath:imported.path),"Importer produced no primary checkpoint: \(imported.path)")
+  let companions=try fm.contentsOfDirectory(at:models,includingPropertiesForKeys:nil).filter {
+    $0.lastPathComponent != name && $0.lastPathComponent != name+"-tensordata" && ($0.pathExtension=="ckpt" || $0.lastPathComponent.hasSuffix(".ckpt-tensordata"))
+  }.sorted {$0.lastPathComponent<$1.lastPathComponent}
+  for file in companions {
+    let target=destination.deletingLastPathComponent().appendingPathComponent(file.lastPathComponent)
+    try require(!fm.fileExists(atPath:target.path),"Imported companion output already exists: \(target.path)")
+  }
+  var manifest=try convert(Store(imported),destination,options)
+  for file in companions {try fm.linkItem(at:file,to:destination.deletingLastPathComponent().appendingPathComponent(file.lastPathComponent))}
+  specification["file"]=destination.lastPathComponent
+  try json(specification).write(to:specURL,options:.withoutOverwriting)
+  manifest["input"]=source.path;manifest["importer"]=executable.path;manifest["imported_model_version"]=specification["version"]
+  manifest["model_specification"]=specURL.lastPathComponent;manifest["imported_companions"]=companions.map(\.lastPathComponent)
+  try json(manifest).write(to:destination.deletingPathExtension().appendingPathExtension("validation.json"),options:.atomic)
+  try fm.removeItem(at:stage)
+  return manifest
 }
 
 let help="""
-dt-i4x 0.1.0
-Convert native Draw Things checkpoint matrices to 4-bit S (i4x).
+dt-i4x 0.2.0
+Quantize a Draw Things checkpoint or safetensors model.
 
-Usage: dt-i4x INPUT.ckpt [-o OUTPUT_FOLDER] [OPTIONS]
+Usage: dt-i4x INPUT [-o DIR] [OPTIONS]
 
-  -o, --output-dir DIR  Output folder (default: input folder)
-  --inspect             Inspect source codecs without writing files
-  --all-matrices        Convert all floating-point 2D matrices, including vision/DiT
-  --no-hadamard         Disable H256 for recognized Qwen linear operators
-  -q, --quiet           Print only the finished output path
-  --version             Print version
-  -h, --help            Show this help
+Options:
+  -o, --output-dir DIR    Output folder (default: input folder)
+  --format FORMAT        Output quantization (default: i4x)
+  --inspect              Inspect the input without converting
+  --no-hadamard          Disable automatic H256 rotation
+  --draw-things-cli PATH  Safetensors importer (default: found on PATH)
+  -q, --quiet            Print only the finished output path
+  --version              Print version
+  -h, --help             Show this help
 
-Sources: raw FP16/FP32/FP64/BF16, EZM7 FP16, i8x, q4p/q5p/q6p/q7p/q8p.
-Other selected codecs are rejected before output is created.
-Input files and Draw Things configuration are never modified.
+Formats:
+  Standard:  i2x, i3x, i4x, i5x, i6x
+  IQ:        iq2xxs, iq2xs, iq2s, iq3xxs, iq3s
+
+Defaults:
+  The input defines what gets quantized. Convolutions and vectors are preserved.
+  H256 is automatic for supported operators. Progress appears during conversion.
+
+Safetensors:
+  Requires the official draw-things-cli importer; import runs offline.
+
+Examples:
+  dt-i4x model.ckpt --format i3x
+  dt-i4x model.safetensors -o converted
 """
 func run() throws {
   let args=Array(CommandLine.arguments.dropFirst())
   if args.isEmpty || args.contains("--help") || args.contains("-h") {print(help);return}
-  if args==["--version"] {print("0.1.0");return}
-  var input:String?,directory:String?,all=false,hadamard=true,inspection=false,quiet=false,index=0
+  if args==["--version"] {print("0.2.0");return}
+  var input:String?,directory:String?,importer:String?,hadamard=true,inspection=false,quiet=false,index=0
+  var format=quantizationFormats[0]
   while index<args.count {
     let arg=args[index]
     switch arg {
     case "-o","--output-dir":index+=1;try require(index<args.count,"Missing output folder");directory=args[index]
+    case "--format":index+=1;try require(index<args.count,"Missing output format");format=try targetFormat(args[index])
+    case "--draw-things-cli":index+=1;try require(index<args.count,"Missing importer path");importer=args[index]
     case "--inspect":inspection=true
-    case "--all-matrices":all=true
     case "--no-hadamard":hadamard=false
     case "--quiet","-q":quiet=true
     default:try require(!arg.hasPrefix("-") && input==nil,"Unexpected argument: \(arg)");input=arg
@@ -315,12 +472,20 @@ func run() throws {
   guard let input else {throw Failure.message("Missing input checkpoint")}
   let sourceURL=URL(fileURLWithPath:(input as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath()
   let folder=directory.map {URL(fileURLWithPath:($0 as NSString).expandingTildeInPath,isDirectory:true).standardizedFileURL} ?? sourceURL.deletingLastPathComponent()
-  let options=Options(input:sourceURL,outputDirectory:folder,all:all,hadamard:hadamard,inspect:inspection,quiet:quiet)
-  let source=try Store(sourceURL)
-  if inspection {print(String(data:try json(inspect(source,all)),encoding:.utf8)!);return}
-  let stem=sourceURL.deletingPathExtension().lastPathComponent.replacingOccurrences(of:"_(?:i[2-8]x|q[4-8]p|f16|fp16|bf16|f32|fp32)$",with:"",options:.regularExpression)
-  let destination=folder.appendingPathComponent(stem+"_i4x.ckpt")
-  try require(destination.standardizedFileURL != sourceURL,"Input already has the target filename; choose another output folder")
-  try convert(source,destination,options)
+  let options=Options(input:sourceURL,outputDirectory:folder,hadamard:hadamard,inspect:inspection,quiet:quiet,format:format)
+  let destination=outputURL(sourceURL,folder,format)
+  try require(inspection || destination.standardizedFileURL != sourceURL,"Input already has the target filename; choose another output folder")
+  let manifest:[String:Any]
+  if sourceURL.pathExtension.lowercased()=="safetensors" {
+    let executable=try importerExecutable(importer)
+    if inspection {try inspectSafetensors(sourceURL,executable);return}
+    manifest=try convertSafetensors(sourceURL,destination,options,executable)
+  } else {
+    let source=try Store(sourceURL)
+    if inspection {print(String(data:try json(inspect(source,hadamard)),encoding:.utf8)!);return}
+    manifest=try convert(source,destination,options)
+  }
+  print(destination.path)
+  if !quiet {print(String(format:"%.2f GiB; %d matrices converted; all %d tensor payloads verified.",Double((manifest["output_bytes"] as! NSNumber).uint64Value)/pow(1024,3),manifest["converted_tensors"] as! Int,manifest["total_tensors"] as! Int))}
 }
 do {try run()} catch {FileHandle.standardError.write(Data("dt-i4x: \(error)\n".utf8));exit(1)}

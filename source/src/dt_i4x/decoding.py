@@ -6,6 +6,7 @@ import zlib
 import numpy as np
 
 from .codec import DT_F16, DT_F32, DT_F64, DT_BF16
+from .formats import BY_ID
 
 RAW = 0
 EZM7 = 0x511
@@ -14,7 +15,7 @@ EXTERNAL = 0x10000000
 H256_ID = 0x01000000
 FLOAT_DTYPES = {DT_F16, DT_F32, DT_F64, DT_BF16}
 PALETTES = {0x8A1E4B: 4, 0x8A1E5B: 5, 0x8A1E6B: 6, 0x8A1E7B: 7, 0x8A1E8B: 8}
-SUPPORTED = {RAW, EZM7, I8X, *PALETTES}
+SUPPORTED = {RAW, EZM7, I8X, *PALETTES, *BY_ID}
 
 
 def source_codec(identifier):
@@ -22,6 +23,8 @@ def source_codec(identifier):
 
 
 def codec_name(identifier):
+    if source_codec(identifier) in BY_ID:
+        return BY_ID[source_codec(identifier)].suffix
     return {RAW: 'raw', EZM7: 'ezm7', I8X: 'i8x', 0x8A1EAB: 'i4x',
             0x8A1E4B: 'q4p', 0x8A1E5B: 'q5p', 0x8A1E6B: 'q6p',
             0x8A1E7B: 'q7p', 0x8A1E8B: 'q8p'}.get(source_codec(identifier), hex(identifier))
@@ -36,6 +39,12 @@ def logical(values, datatype):
 def decode(data, shape, datatype, identifier, native):
     base = source_codec(identifier)
     count = math.prod(shape)
+    if base in BY_ID:
+        packed = BY_ID[base].packed | (0x100 if identifier & H256_ID else 0)
+        expected = native.size(packed, datatype, count, shape[-1])
+        if not expected or len(data) != expected:
+            raise ValueError('Incorrect packed rowwise payload length or incompatible H256 width')
+        return native.decode(data, shape, datatype, packed)
     if base == I8X:
         if identifier & H256_ID:
             raise ValueError('Unexpected H256 flag on unpacked i8x input')

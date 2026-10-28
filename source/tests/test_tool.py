@@ -61,7 +61,7 @@ class ToolTests(unittest.TestCase):
                 original = source.read_bytes()
                 result = convert(source, dest, quiet=True)
                 self.assertEqual(source.read_bytes(), original)
-                self.assertEqual(result['converted_tensors'], 1)
+                self.assertEqual(result['converted_tensors'], 2)
                 before, after = Store(source), Store(dest)
                 original_rows = {r[0]: r for r in before.iter_records()}
                 output_rows = {r[0]: r for r in after.iter_records()}
@@ -69,15 +69,13 @@ class ToolTests(unittest.TestCase):
                 for name, row in output_rows.items():
                     _, typ, fmt, dt, dim, data = row
                     payload, _ = after.payload(typ, data)
-                    if name.startswith('__vision_model__'):
-                        self.assertEqual(payload, original_rows[name][-1])
-                    else:
-                        self.assertEqual((typ >> 32) & 0x0fffffff, 0x018A1EAB)
-                        shape = shape_of(dim)
-                        x = decode(original_rows[name][-1], shape, dt, 0, native)
-                        y = native.decode(payload, shape, dt, Q4K | H256)
-                        error = np.linalg.norm(logical(y, dt) - logical(x, dt)) / np.linalg.norm(logical(x, dt))
-                        self.assertLess(error, .1)
+                    rotation = not name.startswith('__vision_model__')
+                    self.assertEqual((typ >> 32) & 0x0fffffff, 0x8A1EAB | (0x1000000 if rotation else 0))
+                    shape = shape_of(dim)
+                    x = decode(original_rows[name][-1], shape, dt, 0, native)
+                    y = native.decode(payload, shape, dt, Q4K | (H256 if rotation else 0))
+                    error = np.linalg.norm(logical(y, dt) - logical(x, dt)) / np.linalg.norm(logical(x, dt))
+                    self.assertLess(error, .1)
 
     def test_zero_tensor_is_valid(self):
         with tempfile.TemporaryDirectory() as root:

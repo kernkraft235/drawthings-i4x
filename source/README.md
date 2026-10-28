@@ -1,88 +1,78 @@
-# Draw Things i4x
+# Draw Things quantizer (`dt-i4x`)
 
-A small, standalone macOS command-line tool that converts native Draw Things checkpoint matrices to **4-bit S (`i4x`)**. Built with Swift and the upstream ccv CPU quantizer. No Python, NumPy, compiler, app installation, model download, or network connection is required to run the executable.
-
-The initial use case is the Qwen3-VL 8B text encoder used by Qwen Image 2.1. Its 8.18 GiB native i8x checkpoint converts to a 4.51 GiB file while preserving the vision tower and small tensors.
+A macOS command-line tool for quantizing native Draw Things checkpoints. It reuses the upstream ccv CPU quantizers. Single-file safetensors input is imported through the official Draw Things CLI, which detects the architecture and remaps PyTorch tensor names.
 
 ## Use
 
-Unzip the macOS release and run its `dt-i4x` executable:
-
 ```sh
-./dt-i4x qwen_3_vl_8b_instruct_i8x.ckpt
+./dt-i4x diffusion_model_f16.ckpt
+./dt-i4x diffusion_model_f16.ckpt --format i3x
+./dt-i4x diffusion_model.safetensors --format iq2xxs -o converted
+./dt-i4x diffusion_model_f16.ckpt --inspect
 ```
 
-The output is `qwen_3_vl_8b_instruct_i4x.ckpt`, in the same folder as the input. To choose another folder:
+i4x (native Q4K) is the default. Output goes beside the input unless `-o DIR` is given. Every eligible 2D matrix in the supplied checkpoint is selected, including diffusion, vision, and text components. Convolutions, biases, normalization vectors, and matrices with a singleton dimension are preserved.
 
-```sh
-./dt-i4x qwen_3_vl_8b_instruct_i8x.ckpt -o converted
-```
+The supplied file determines the scope automatically; no component-selection flags are needed. Input checkpoints and sidecars are read-only; existing outputs and validation manifests are never overwritten.
 
-Inspect a checkpoint before converting:
+## Output formats
 
-```sh
-./dt-i4x qwen_3_vl_8b_instruct_i8x.ckpt --inspect
-```
+Use `--format NAME`; names are case insensitive, and spellings such as `Q3_K` and `i3x` are accepted.
 
-Default selection is 2D matrices inside `__text_model__` and numbered text-model namespaces. Norms, biases, small vectors, and the vision/diffusion models are preserved. `--all-matrices` explicitly selects every floating-point 2D matrix instead. `--no-hadamard` disables rotation. `-q` prints only the finished output path.
+| Format | Internal alias | Packed bits per weight before row scales/alignment |
+| --- | --- | --- |
+| i4x (default) | q4k | 4.5 |
+| i3x | q3k | 3.5 |
+| i2x | q2k | 2.625 |
+| iq3s, iq3xxs | corresponding format name | 3.5 |
+| iq2s, iq2xs | corresponding format name | 2.625 |
+| iq2xxs | iq2xxs | 2 |
+| i5x | q5k | 5.5 |
+| i6x | q6k | 6.5 |
 
-Input files and sidecars are read-only. Existing output checkpoints are never overwritten. The tool does not edit `custom.json`, model registration, app settings, or any other Draw Things files. Register the resulting checkpoint yourself.
+These are Draw Things native packed rowwise formats in the i8x codec family, not GGUF files. Group metadata is included in the figures above; row scales, alignment, and preserved tensors add to the final size. Lower bit counts trade weight precision for storage. Model loading and generation quality depend on the Draw Things runtime and model-specific loader.
 
-## Input support
+Legacy q4p-q8p palettes are accepted as inputs. This tool does not write legacy palette formats. Original floating-point weights are preferable to requantizing compressed weights.
 
-| Source representation | Supported |
-| --- | --- |
-| Raw FP16, FP32, FP64, BF16 | Yes |
-| Native rowwise i8x | Yes |
-| DT palette q4p, q5p, q6p, q7p, q8p | Yes |
-| EZM7-compressed FP16 | Yes |
-| Single-file trailer stores | Yes |
-| SQLite plus `-tensordata` sidecar | Yes, keep the sidecar beside its checkpoint |
-| SQLite tensor splits | Yes |
-| Other selected codecs, including existing packed i4x/i5x/i6x | Rejected before output is created |
-| Safetensors, GGUF, PyTorch checkpoints | No; import into native DT format first |
+## Hadamard and progress
 
-The source does **not** need to be i8x. Original floating-point weights are preferable to requantizing existing compressed weights. Unsupported codecs in tensors that are not selected for conversion are preserved unchanged.
+H256 is automatic only for recognized Qwen-style projection operators in text-model namespaces whose input width is divisible by 256. Embeddings, diffusion/vision operators, unknown operators, and incompatible widths stay unrotated. This deliberately keeps the established operator allowlist rather than guessing compatibility from matrix dimensions. `--no-hadamard` disables H256 globally and has no effect on matrices already using unrotated packing. Native `--inspect` reports the automatic H256/unrotated matrix counts, respecting that flag.
 
-Palette block sizes must be divisible by eight. Q5/Q7 tails must contain a multiple of eight weights, and Q6 tails a multiple of four; unusual partial tails are rejected before native decoding.
+Progress goes to stderr and shows completed/total matrices, percentage of selected parameters, elapsed time, and the active tensor. Assembly and hashing report byte progress, and final payload verification reports tensor progress. `-q` suppresses progress and prints only the finished main checkpoint path.
 
-The output uses DT's own rowwise Q4K representation, internally exposed by s4nnc as `.i8x(.q4k)`. This is **not a GGUF Q4_K file**. H256 rotation is applied only to recognized Qwen linear operators with suitable dimensions; token embeddings and other operators use plain Q4K. Older model-specific DT loaders must also accept the i8x codec family to load a new i4x checkpoint. Storage conversion alone does not change the app's loading policy.
+## Safetensors input
 
-## Verification and output
+Install the official `draw-things-cli` separately, or provide `--draw-things-cli /path/to/draw-things-cli`. Native checkpoint conversion has no importer dependency.
 
-Each converted tensor is decoded with the upstream decoder and checked for finite values and sampled relative weight error. The final SQLite database, tensor names, every payload hash, and whole-file SHA-256 are checked. A `.validation.json` manifest is written alongside the checkpoint.
+The tool runs `draw-things-cli models import` offline, with companion downloads disabled, inside `<output>.import.work/models`. Supported architectures and input layouts are those recognized by that installed importer. A single `.safetensors` model artifact is accepted; Diffusers directories and sharded index files are not assembled by this tool. Unsupported architectures fail through the official importer rather than receiving guessed tensor mappings.
 
-Conversion stages files inside `<output>.work`. On success that generated directory is removed. On interruption/failure, the original input stays unchanged and the work directory remains for inspection; remove that specific generated directory before retrying the same output path. Allow disk space for approximately twice the final checkpoint size during conversion.
+The imported main checkpoint is quantized. Any companion checkpoints extracted by the importer are copied unchanged beside it. A separate `<output-stem>.model.json` preserves the inferred model specification with its main filename updated. Import does not register the result in your installed Draw Things app or edit its configuration. Register the result yourself; missing companions must already be available or supplied separately.
 
-The Qwen3-VL 8B example converted all 253 text matrices (7,568,097,280 weights); all 856 tensors were verified, with the other 603 tensors preserved. Runtime image quality and device memory behavior are evaluated by loading the file in Draw Things.
+For safetensors, `--inspect` uses the upstream importer's dry run to report the detected model and projected files. It does not import or quantize weights. Native `--inspect` returns codec and matrix-selection JSON.
+
+## Native input support
+
+Raw FP16/FP32/FP64/BF16, rowwise i8x, EZM7 FP16, q4p-q8p palettes, and all packed formats listed above (including H256 variants) are supported. Trailer stores, SQLite tensor splits, and `-tensordata` sidecars are supported. Keep sidecars beside their checkpoints. Unsupported selected codecs or datatypes fail preflight. Unselected payloads are preserved.
+
+## Verification and temporary files
+
+Each converted tensor is decoded and checked for finite values and sampled relative weight RMSE, with the existing 0.30 error limit. Aggressive lower-bit formats can fail that limit on difficult tensors. Final tensor payload hashes, SQLite integrity, and the whole-file SHA-256 are checked. Results are recorded in a `.validation.json` manifest; these checks do not establish generation quality.
+
+Native conversion stages files in `<output>.work`; the executable removes that directory on success. Safetensors import also uses `<output>.import.work` and removes its generated full-precision import after success. On failure, generated work directories remain for inspection and the original input stays unchanged. Remove the specific work directory before retrying that output path. Allow approximately twice the quantized output size for native conversion, plus the full-precision import and any extracted companions for safetensors.
 
 ## Build
 
-The included release binary targets **Apple Silicon, macOS 13+**. Building requires Xcode or Apple Command Line Tools:
+The executable targets macOS 13+ on the host architecture (Apple Silicon tested). Building requires Xcode or Apple Command Line Tools:
 
 ```sh
 ./script/build_and_run.sh --build-only
 ./dist/dt-i4x --help
 ```
 
-The script uses the host architecture. The build has been tested on Apple Silicon. The native executable links only system libraries and frameworks; it does not unpack a runtime into a temporary directory.
-
-## Tests and reference implementation
-
-The Python implementation is retained as a reference and can be installed separately with `python3 -m pip install .`. It requires NumPy and a compiler for its first native codec build. The shipped Swift executable has neither dependency.
-
-After building the executable, run the cross-implementation tests:
-
-```sh
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-Tests cover output-directory defaults, no-clobber behavior, unsupported inputs, primitive source types, i8x, EZM7, all five palette formats, preserved vision tensors, and exact native-versus-reference packed payloads. Independent NumPy decoding of official i4x/H256 data was also used to validate the codec before the full encoder conversion.
+The Python reference implementation is retained, requires NumPy and a compiler for its first native codec build, and shares the CLI behavior. Install it with `python3 -m pip install .`. The Swift executable needs only system libraries/frameworks for native checkpoint conversion.
 
 ## Upstream and license
 
-Quantization implementation and tables: [liuliu/ccv](https://github.com/liuliu/ccv), revision `810fb2992bd4b5463052a8f94338c8bffc273cc6`. The palette decoder is extracted from the same revision. The compatibility headers adapt allocation and IEEE floating-point conversion for a standalone CPU build. Upstream BSD license is included in `src/dt_i4x/native/UPSTREAM-LICENSE.txt`.
+Quantization and palette decoding reuse [liuliu/ccv](https://github.com/liuliu/ccv), revision `810fb2992bd4b5463052a8f94338c8bffc273cc6`. Format identifiers and checkpoint layouts follow [liuliu/s4nnc](https://github.com/liuliu/s4nnc), revision `312811284158240406da8d16e30d22c636df9f29`. Architecture detection and safetensors mapping use the installed [official Draw Things CLI](https://github.com/drawthingsai/draw-things-community/blob/main/Apps/DrawThingsCLI/DrawThingsCLI.swift).
 
-Checkpoint identifiers, external-data layouts, and the trailer-store offset follow [liuliu/s4nnc](https://github.com/liuliu/s4nnc), revision `312811284158240406da8d16e30d22c636df9f29`.
-
-This project is BSD-3-Clause licensed and is independent of the Draw Things app. Model weights are not included.
+This project is BSD-3-Clause licensed and independent of the Draw Things app. Upstream BSD notices are included. Model weights are not included.

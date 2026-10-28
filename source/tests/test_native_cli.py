@@ -73,7 +73,9 @@ class NativeCLITests(unittest.TestCase):
             r = subprocess.run([BINARY, source, '--inspect'], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             details = json.loads(r.stdout)
-            self.assertEqual(details['selected_matrices'], 1)
+            self.assertEqual(details['selected_matrices'], 2)
+            self.assertEqual(details['hadamard_matrices'], 1)
+            self.assertEqual(details['plain_matrices'], 1)
             self.assertEqual(details['unsupported'][0]['codec'], '0xdead')
             r = subprocess.run([BINARY, source], capture_output=True, text=True)
             self.assertEqual(r.returncode, 1)
@@ -147,16 +149,16 @@ class NativeCLITests(unittest.TestCase):
                 self.assertEqual(source.read_bytes(),before)
                 if layout=='sidecar':self.assertEqual(sidecar.read_bytes(),b'\0'*16384+payload)
 
-    def test_all_matrices_explicitly_includes_vision(self):
+    def test_default_includes_vision(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             source=root/'encoder_f16.ckpt'
             fixture(source)
-            r=subprocess.run([BINARY,source,'--all-matrices','-q'],capture_output=True,text=True)
+            r=subprocess.run([BINARY,source,'-q'],capture_output=True,text=True)
             self.assertEqual(r.returncode,0,r.stderr)
             output=Store(root/'encoder_i4x.ckpt')
             self.assertEqual(len(output.records),2)
-            self.assertTrue(all(((r[1]>>32)&0xeffffff)==0x8a1eab for r in output.records))
+            self.assertTrue(all(((row[1]>>32)&0xeffffff)==0x8a1eab for row in output.records))
 
 
 if __name__ == '__main__':
