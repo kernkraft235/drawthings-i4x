@@ -36,6 +36,10 @@ def fixture(path, datatype=DT_F16, unsupported=False, zero=False):
 
 
 class ToolTests(unittest.TestCase):
+    def test_shape_stops_before_trailing_metadata(self):
+        dim = struct.pack('<12i', 1, 1, 128, 0, 256, *([0] * 7))
+        self.assertEqual(shape_of(dim), (1, 1, 128))
+
     def test_output_folder_and_filename(self):
         with tempfile.TemporaryDirectory() as root:
             source = Path(root) / 'encoder_i8x.ckpt'

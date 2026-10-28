@@ -64,11 +64,12 @@ func fileDigest(_ url: URL, progress: ((Int,Int)->Void)? = nil) throws -> String
 func json(_ object: Any) throws -> Data { try JSONSerialization.data(withJSONObject:object,options:[.prettyPrinted,.sortedKeys]) }
 func dimensions(_ data: Data) throws -> [Int] {
   try require(data.count % 4 == 0,"Invalid dimension metadata")
-  var result=[Int](); var ended=false
+  var result=[Int]()
   for i in stride(from:0,to:data.count,by:4) {
     let d=try integer(data,i,4)
-    if d==0 {ended=true;continue}
-    try require(!ended && d<=UInt64(Int32.max),"Invalid tensor dimensions")
+    // ccv ends the logical shape at the first zero; remaining slots can hold codec metadata.
+    if d==0 {break}
+    try require(d<=UInt64(Int32.max),"Invalid tensor dimensions")
     result.append(Int(d))
   }
   return result
@@ -420,7 +421,7 @@ func convertSafetensors(_ source:URL,_ destination:URL,_ options:Options,_ execu
 }
 
 let help="""
-dt-i4x 0.2.0
+dt-i4x 0.2.1
 Quantize a Draw Things checkpoint or safetensors model.
 
 Usage: dt-i4x INPUT [-o DIR] [OPTIONS]
@@ -453,7 +454,7 @@ Examples:
 func run() throws {
   let args=Array(CommandLine.arguments.dropFirst())
   if args.isEmpty || args.contains("--help") || args.contains("-h") {print(help);return}
-  if args==["--version"] {print("0.2.0");return}
+  if args==["--version"] {print("0.2.1");return}
   var input:String?,directory:String?,importer:String?,hadamard=true,inspection=false,quiet=false,index=0
   var format=quantizationFormats[0]
   while index<args.count {

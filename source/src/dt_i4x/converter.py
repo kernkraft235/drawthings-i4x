@@ -29,8 +29,18 @@ PALETTES = set(range(0x8A1E4B, 0x8A1E8C, 0x10))
 
 
 def shape_of(dim):
+    if len(dim) % 4:
+        raise ValueError('Invalid dimension metadata')
     dims = struct.unpack('<' + 'i' * (len(dim) // 4), dim)
-    return tuple(d for d in dims if d > 0)
+    shape = []
+    for d in dims:
+        # Match ccv: slots after the shape terminator are not dimensions.
+        if d == 0:
+            break
+        if d < 0:
+            raise ValueError('Invalid tensor dimensions')
+        shape.append(d)
+    return tuple(shape)
 
 
 class Store:

@@ -19,6 +19,21 @@ BINARY = ROOT / 'dist/dt-i4x'
 
 @unittest.skipUnless(BINARY.exists(), 'Build native binary before running native CLI tests')
 class NativeCLITests(unittest.TestCase):
+    def test_inspect_accepts_trailing_dimension_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'seedvr2_fixture.ckpt'
+            fixture(source)
+            db = __import__('sqlite3').connect(source)
+            dim = struct.pack('<12i', 1, 1, 128, 0, 256, *([0] * 7))
+            db.execute('INSERT INTO tensors VALUES(?,?,?,?,?,?)',
+                       ('__dit__[t-vid_norm_k-0-0]', 1, 1, DT_F16, dim, bytes(256)))
+            db.commit(); db.close()
+            result = subprocess.run([BINARY, source, '--inspect'], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            details = json.loads(result.stdout)
+            self.assertEqual(details['total_tensors'], 3)
+            self.assertEqual(details['selected_matrices'], 2)
+
     def test_i8x_ezm7_and_all_palette_sources_match_reference(self):
         rng = np.random.default_rng(15)
         for source_codec in ('i8x', 'ezm7', 4, 5, 6, 7, 8):
